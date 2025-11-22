@@ -8,6 +8,7 @@
 #include <sys/ioctl.h>
 #include <thread>
 #include <unistd.h>
+#include <set>
 
 namespace LogiLinux {
 
@@ -20,7 +21,7 @@ struct MXKeypadDevice::Impl {
   bool initialized = false;
   std::atomic<bool> monitoring = false;
   std::thread monitor_thread;
-  uint8_t last_button_state = 0;
+  std::set<uint8_t> pressed_buttons; // Track all currently pressed buttons
   uint8_t last_p_button = 0; // Track last pressed P1/P2 button (0xa1 or 0xa2)
 
   const std::vector<std::vector<uint8_t>> INIT_REPORTS = {
@@ -197,36 +198,40 @@ void MXKeypadDevice::startMonitoring() {
       if (bytes_read > 0 && bytes_read >= 7) {
         uint8_t current_state = report[6];
 
-        // Button release detection (1-9 = buttons)
-        if (impl_->last_button_state >= 1 &&
-            impl_->last_button_state <= 9 && current_state == 0) {
-          auto event = std::make_shared<ButtonEvent>();
-          event->type = EventType::BUTTON_RELEASE;
-          event->button_code = impl_->last_button_state - 1;
-          event->pressed = false;
-          event->timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-              std::chrono::steady_clock::now().time_since_epoch()).count();
+        // Grid button detection (1-9 = buttons, 0 = no button)
+        if (current_state >= 1 && current_state <= 9) {
+          // Button is pressed - add to set if not already there
+          uint8_t button_code = current_state - 1;
+          if (impl_->pressed_buttons.find(button_code) == impl_->pressed_buttons.end()) {
+            impl_->pressed_buttons.insert(button_code);
+            
+            auto event = std::make_shared<ButtonEvent>();
+            event->type = EventType::BUTTON_PRESS;
+            event->button_code = button_code;
+            event->pressed = true;
+            event->timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
 
-          if (event_callback_) {
-            event_callback_(event);
+            if (event_callback_) {
+              event_callback_(event);
+            }
           }
-        }
-        // Button press detection
-        else if (current_state >= 1 && current_state <= 9 &&
-                 impl_->last_button_state == 0) {
-          auto event = std::make_shared<ButtonEvent>();
-          event->type = EventType::BUTTON_PRESS;
-          event->button_code = current_state - 1;
-          event->pressed = true;
-          event->timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-              std::chrono::steady_clock::now().time_since_epoch()).count();
+        } else if (current_state == 0) {
+          // No button pressed - release all currently pressed buttons
+          for (uint8_t button_code : impl_->pressed_buttons) {
+            auto event = std::make_shared<ButtonEvent>();
+            event->type = EventType::BUTTON_RELEASE;
+            event->button_code = button_code;
+            event->pressed = false;
+            event->timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
 
-          if (event_callback_) {
-            event_callback_(event);
+            if (event_callback_) {
+              event_callback_(event);
+            }
           }
+          impl_->pressed_buttons.clear();
         }
-
-        impl_->last_button_state = current_state;
       }
       
       // P1/P2 navigation button detection
